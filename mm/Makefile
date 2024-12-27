@@ -2,6 +2,12 @@
 # Makefile for the linux memory manager.
 #
 
+ccflags-y += -I$(srctree)/drivers/misc/mediatek/include
+
+ifdef CONFIG_MTK_ION
+subdir-ccflags-y += -I$(srctree)/drivers/staging/android/ion
+endif
+
 KASAN_SANITIZE_slab_common.o := n
 KASAN_SANITIZE_slab.o := n
 KASAN_SANITIZE_slub.o := n
