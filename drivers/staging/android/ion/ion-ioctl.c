@@ -190,13 +190,18 @@ long ion_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		handle = ion_handle_get_by_id_nolock(client, data.handle.handle);
 		if (IS_ERR(handle)) {
 			mutex_unlock(&client->lock);
-			return PTR_ERR(handle);
+			ret = PTR_ERR(handle);
+			IONMSG("ION_IOC_SHARE handle(%d) is invalid, ret %d\n",
+			       data.handle.handle, ret);
+			return ret;
 		}
 		data.fd.fd = ion_share_dma_buf_fd_nolock(client, handle);
 		ion_handle_put_nolock(handle);
 		mutex_unlock(&client->lock);
-		if (data.fd.fd < 0)
+		if (data.fd.fd < 0) {
+			IONMSG("ION_IOC_SHARE fd = %d.\n", data.fd.fd);
 			ret = data.fd.fd;
+		}
 		break;
 	}
 	case ION_IOC_IMPORT:
@@ -206,6 +211,9 @@ long ion_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		handle = ion_import_dma_buf_fd(client, data.fd.fd);
 		if (IS_ERR(handle)) {
 			ret = PTR_ERR(handle);
+			IONMSG("ion_import fail: fd=%d, ret=%d\n",
+			       data.fd.fd, ret);
+			return ret;
 		} else {
 			data.handle.handle = handle->id;
 			handle = pass_to_user(handle);
@@ -223,8 +231,10 @@ long ion_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	}
 	case ION_IOC_CUSTOM:
 	{
-		if (!dev->custom_ioctl)
+		if (!dev->custom_ioctl) {
+			IONMSG("ION_IOC_CUSTOM dev has no custom ioctl!.\n");
 			return -ENOTTY;
+		}
 		ret = dev->custom_ioctl(client, data.custom.cmd,
 						data.custom.arg);
 		break;
