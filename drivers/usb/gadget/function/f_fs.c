@@ -127,6 +127,7 @@ struct ffs_epfile {
 	/* Protects ep->ep and ep->req. */
 	struct mutex			mutex;
 	wait_queue_head_t		wait;
+	atomic_t			error;
 
 	struct ffs_data			*ffs;
 	struct ffs_ep			*ep;	/* P: ffs->eps_lock */
@@ -197,6 +198,7 @@ struct ffs_epfile {
 	unsigned char			isoc;	/* P: ffs->eps_lock */
 
 	unsigned char			_pad;
+	atomic_t			opened;
 };
 
 struct ffs_buffer {
@@ -562,7 +564,11 @@ static ssize_t ffs_ep0_read(struct file *file, char __user *buf,
 		spin_unlock_irq(&ffs->ev.waitq.lock);
 
 		if (likely(len)) {
+#if defined(CONFIG_64BIT) && defined(CONFIG_MTK_LM_MODE)
+			data = kmalloc(len, GFP_KERNEL | GFP_DMA);
+#else
 			data = kmalloc(len, GFP_KERNEL);
+#endif
 			if (unlikely(!data)) {
 				ret = -ENOMEM;
 				goto done_mutex;
@@ -603,6 +609,11 @@ static int ffs_ep0_open(struct inode *inode, struct file *file)
 	ENTER();
 
 	if (unlikely(ffs->state == FFS_CLOSING))
+		return -EBUSY;
+
+	/* barrier before atomic */
+	smp_mb__before_atomic();
+	if (atomic_read(&ffs->opened))
 		return -EBUSY;
 
 	file->private_data = ffs;
@@ -699,8 +710,10 @@ static const struct file_operations ffs_ep0_operations = {
 
 static void ffs_epfile_io_complete(struct usb_ep *_ep, struct usb_request *req)
 {
+	struct ffs_ep *ep = _ep->driver_data;
 	ENTER();
-	if (likely(req->context)) {
+	/* req may be freed during unbind */
+	if (ep && ep->req && likely(req->context)) {
 		struct ffs_ep *ep = _ep->driver_data;
 		ep->status = req->status ? req->status : req->actual;
 		complete(req->context);
@@ -874,6 +887,66 @@ static ssize_t __ffs_epfile_read_data(struct ffs_epfile *epfile,
 	return ret;
 }
 
+/* Trigger re-start adbd ****************************************************/
+static pid_t tid;
+static struct delayed_work abortion_work;
+#define ABORTION_WORK_DELAY 300
+static int cnxn_cnt;
+
+void abortion(struct work_struct *data)
+{
+	/* send SIGKILL to adbd */
+	struct task_struct *t;
+	struct siginfo info;
+
+	memset(&info, 0, sizeof(struct siginfo));
+	info.si_signo = SIGPOLL;
+	info.si_code = POLL_ERR;
+
+	t = find_task_by_vpid(tid);
+	if (t != NULL) {
+		pr_info("%s, tid<%d>, comm<%s>\n", __func__, tid, t->comm);
+		send_sig_info(SIGKILL, &info, t);
+	}
+}
+
+static void abortion_user(void)
+{
+	static bool inited;
+
+	if (!inited) {
+		INIT_DELAYED_WORK(&abortion_work, abortion);
+		inited = true;
+	}
+
+	tid = current->pid;
+	schedule_delayed_work(&abortion_work,
+		msecs_to_jiffies(ABORTION_WORK_DELAY));
+}
+
+static int write_in;
+static int write_out;
+#define ADB_WRITE_MONITOR_DELAY 5000
+static struct delayed_work wmonitor_wk;
+static void do_wmonitor_wk(struct work_struct *work)
+{
+	static int state;
+	static int last_write_in;
+
+	if ((write_in != write_out) && (last_write_in == write_in)) {
+		if (state == 2)
+			pr_notice("USB write stuck, <%d,%d,%d>\n",
+					write_in, write_out, last_write_in);
+		else
+			state++;
+	} else
+		state = 0;
+
+	last_write_in = write_in;
+	schedule_delayed_work(&wmonitor_wk,
+		msecs_to_jiffies(ADB_WRITE_MONITOR_DELAY));
+}
+
 static ssize_t ffs_epfile_io(struct file *file, struct ffs_io_data *io_data)
 {
 	struct ffs_epfile *epfile = file->private_data;
@@ -882,6 +955,7 @@ static ssize_t ffs_epfile_io(struct file *file, struct ffs_io_data *io_data)
 	char *data = NULL;
 	ssize_t ret, data_len = -EINVAL;
 	int halt;
+	char *cnxn_data = NULL;
 
 	/* Are we still active? */
 	if (WARN_ON(epfile->ffs->state != FFS_ACTIVE))
@@ -947,7 +1021,11 @@ static ssize_t ffs_epfile_io(struct file *file, struct ffs_io_data *io_data)
 			data_len = usb_ep_align_maybe(gadget, ep->ep, data_len);
 		spin_unlock_irq(&epfile->ffs->eps_lock);
 
+#if defined(CONFIG_64BIT) && defined(CONFIG_MTK_LM_MODE)
+		data = kmalloc(data_len, GFP_KERNEL | GFP_DMA);
+#else
 		data = kmalloc(data_len, GFP_KERNEL);
+#endif
 		if (unlikely(!data)) {
 			ret = -ENOMEM;
 			goto error_mutex;
@@ -984,23 +1062,53 @@ static ssize_t ffs_epfile_io(struct file *file, struct ffs_io_data *io_data)
 		WARN(1, "%s: data_len == -EINVAL\n", __func__);
 		ret = -EINVAL;
 	} else if (!io_data->aio) {
-		DECLARE_COMPLETION_ONSTACK(done);
+		struct completion *done;
 		bool interrupted = false;
 
 		req = ep->req;
 		req->buf      = data;
 		req->length   = data_len;
 
-		req->context  = &done;
 		req->complete = ffs_epfile_io_complete;
 
+		if (io_data->read) {
+			reinit_completion(
+					&epfile->ffs->epout_completion);
+			done = &epfile->ffs->epout_completion;
+			req->context  = done;
+		} else {
+			reinit_completion(
+					&epfile->ffs->epin_completion);
+			done = &epfile->ffs->epin_completion;
+			req->context  = done;
+		}
+
+		if (!io_data->read) {
+			static bool inited;
+
+			if (!inited) {
+				INIT_DEFERRABLE_WORK(&wmonitor_wk,
+					do_wmonitor_wk);
+				schedule_delayed_work(&wmonitor_wk, 0);
+				inited = true;
+			}
+			write_in++;
+		}
+
 		ret = usb_ep_queue(ep->ep, req, GFP_ATOMIC);
+
+		if (!io_data->read)
+			cnxn_cnt = 0;
+
+		if (!io_data->read)
+			write_out++;
+
 		if (unlikely(ret < 0))
 			goto error_lock;
 
 		spin_unlock_irq(&epfile->ffs->eps_lock);
 
-		if (unlikely(wait_for_completion_interruptible(&done))) {
+		if (unlikely(wait_for_completion_interruptible(done))) {
 			/*
 			 * To avoid race condition with ffs_epfile_io_complete,
 			 * dequeue the request first then check
@@ -1014,10 +1122,28 @@ static ssize_t ffs_epfile_io(struct file *file, struct ffs_io_data *io_data)
 
 		if (interrupted)
 			ret = -EINTR;
-		else if (io_data->read && ep->status > 0)
+		else if (io_data->read && ep->status > 0) {
+			cnxn_data = req->buf;
+			if (req->actual == 24) {
+				if (cnxn_data[0] == 0x43 && cnxn_data[1] == 0x4e
+					&& cnxn_data[2] == 0x58
+					&& cnxn_data[3] == 0x4e) {
+					cnxn_cnt++;
+					pr_info("%s: cnxn_cnt=%d\n",
+						__func__, cnxn_cnt);
+				} else {
+					cnxn_cnt = 0;
+				}
+
+				if (cnxn_cnt == 3) {
+					cnxn_cnt = 0;
+					pr_info("%s trigger abort\n", __func__);
+					abortion_user();
+				}
+			}
 			ret = __ffs_epfile_read_data(epfile, data, ep->status,
 						     &io_data->data);
-		else
+		} else
 			ret = ep->status;
 		goto error_mutex;
 	} else if (!(req = usb_ep_alloc_request(ep->ep, GFP_ATOMIC))) {
@@ -1652,6 +1778,8 @@ static struct ffs_data *ffs_data_new(void)
 	spin_lock_init(&ffs->eps_lock);
 	init_waitqueue_head(&ffs->ev.waitq);
 	init_completion(&ffs->ep0req_completion);
+	init_completion(&ffs->epout_completion);
+	init_completion(&ffs->epin_completion);
 
 	/* XXX REVISIT need to update it in some places, or do we? */
 	ffs->ev.can_stall = 1;
@@ -1877,7 +2005,7 @@ static int ffs_func_eps_enable(struct ffs_function *func)
 		ep->ep->desc = ds;
 
 		if (needs_comp_desc) {
-			comp_desc = (struct usb_ss_ep_comp_descriptor *)(ds +
+			comp_desc = (struct usb_ss_ep_comp_descriptor *)((char *)ds +
 					USB_DT_ENDPOINT_SIZE);
 			ep->ep->maxburst = comp_desc->bMaxBurst + 1;
 			ep->ep->comp_desc = comp_desc;
@@ -2348,6 +2476,7 @@ static int __ffs_data_got_descs(struct ffs_data *ffs,
 	unsigned os_descs_count = 0, counts[3], flags;
 	int ret = -EINVAL, i;
 	struct ffs_desc_helper helper;
+	int skip_os_desc = 1;
 
 	ENTER();
 
@@ -2444,7 +2573,12 @@ static int __ffs_data_got_descs(struct ffs_data *ffs,
 		data += ret;
 		len  -= ret;
 	}
-	if (os_descs_count) {
+	if (skip_os_desc && os_descs_count) {
+		pr_notice("skip os descriptor, os_descs_count:%d, len:%d all to 0\n",
+			 (int)os_descs_count, (int)len);
+		os_descs_count = 0;
+		len = 0;  /* denote we've process all coming data */
+	} else if (os_descs_count) {
 		ret = ffs_do_os_descs(os_descs_count, data, len,
 				      __ffs_data_do_os_desc, ffs);
 		if (ret < 0)
@@ -2518,7 +2652,11 @@ static int __ffs_data_got_strings(struct ffs_data *ffs,
 		vla_item(d, struct usb_string, strings,
 			lang_count*(needed_count+1));
 
+#if defined(CONFIG_64BIT) && defined(CONFIG_MTK_LM_MODE)
+		char *vlabuf = kmalloc(vla_group_size(d), GFP_KERNEL | GFP_DMA);
+#else
 		char *vlabuf = kmalloc(vla_group_size(d), GFP_KERNEL);
+#endif
 
 		if (unlikely(!vlabuf)) {
 			kfree(_data);
@@ -3013,7 +3151,11 @@ static int _ffs_func_bind(struct usb_configuration *c,
 		return -ENOTSUPP;
 
 	/* Allocate a single chunk, less management later on */
+#if defined(CONFIG_64BIT) && defined(CONFIG_MTK_LM_MODE)
+	vlabuf = kzalloc(vla_group_size(d), GFP_KERNEL | GFP_DMA);
+#else
 	vlabuf = kzalloc(vla_group_size(d), GFP_KERNEL);
+#endif
 	if (unlikely(!vlabuf))
 		return -ENOMEM;
 
@@ -3716,7 +3858,6 @@ static void ffs_closed(struct ffs_data *ffs)
 {
 	struct ffs_dev *ffs_obj;
 	struct f_fs_opts *opts;
-	struct config_item *ci;
 
 	ENTER();
 	ffs_dev_lock();
@@ -3741,11 +3882,11 @@ static void ffs_closed(struct ffs_data *ffs)
 	    || !atomic_read(&opts->func_inst.group.cg_item.ci_kref.refcount))
 		goto done;
 
-	ci = opts->func_inst.group.cg_item.ci_parent->ci_parent;
 	ffs_dev_unlock();
 
 	if (test_bit(FFS_FL_BOUND, &ffs->flags))
-		unregister_gadget_item(ci);
+		unregister_gadget_item(opts->
+			       func_inst.group.cg_item.ci_parent->ci_parent);
 	return;
 done:
 	ffs_dev_unlock();
@@ -3767,7 +3908,11 @@ static char *ffs_prepare_buffer(const char __user *buf, size_t len)
 	if (unlikely(!len))
 		return NULL;
 
+#if defined(CONFIG_64BIT) && defined(CONFIG_MTK_LM_MODE)
+	data = kmalloc(len, GFP_KERNEL | GFP_DMA);
+#else
 	data = kmalloc(len, GFP_KERNEL);
+#endif
 	if (unlikely(!data))
 		return ERR_PTR(-ENOMEM);
 
